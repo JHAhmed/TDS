@@ -134,6 +134,31 @@ async def stats_preflight():
 @app.post("/verify")
 def verify_token(request: TokenRequest):
     try:
+        payload = jwt.decode(
+            request.token,
+            key=PUBLIC_KEY,
+            algorithms=["RS256"],
+            audience=AUDIENCE,
+            issuer=ISSUER,
+            leeway=60  # <-- ADD THIS: Allows for 60 seconds of clock skew between servers
+        )
+        
+        return {
+            "valid": True,
+            "email": payload.get("email"),
+            "sub": payload.get("sub"),
+            "aud": payload.get("aud")
+        }
+        
+    except jwt.InvalidTokenError as e:
+        # Optional: Print the actual PyJWT error to your terminal for debugging
+        print(f"Token validation failed: {e}") 
+        
+        return JSONResponse(
+            status_code=401,
+            content={"valid": False}
+        )
+    try:
         # PyJWT's decode function automatically verifies the signature, 
         # expiration (exp), audience (aud), and issuer (iss) when provided.
         payload = jwt.decode(

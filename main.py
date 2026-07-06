@@ -103,7 +103,7 @@ def parse_values(values: str) -> list[int]:
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the Token Verification API!"}
+    return {"message": "This is main.py!"}
 
 
 @app.get("/stats")

@@ -2,3 +2,5 @@ fastapi
 PyJWT
 PyJWT[crypto]
 uvicorn[standard]
+pydantic
+uvicorn

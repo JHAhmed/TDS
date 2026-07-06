@@ -160,7 +160,7 @@ async def process_analytics(payload: AnalyticsRequest, request: Request):
 @app.get("/work")
 def do_work(n: int = 0):
     # Returns the specified format. Using a dummy email as requested.
-    return {"email": "student@example.com", "done": n}
+    return {"email": EMAIL, "done": n}
 
 @app.get("/metrics")
 def get_metrics():

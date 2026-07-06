@@ -9,6 +9,28 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 import openai
 
+import time
+import uuid
+from datetime import datetime, timezone
+from collections import deque
+from fastapi import FastAPI, Request, Response
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+
+app = FastAPI(title="Instrumented API")
+
+# --- Globals & State ---
+# Track startup time for /healthz uptime calculation
+START_TIME = time.time()
+
+# Prometheus counter for all HTTP requests
+REQUEST_COUNTER = Counter(
+    "http_requests_total", 
+    "Total number of HTTP requests to any endpoint"
+)
+
+# In-memory buffer for logs, kept to a max size to prevent memory leaks
+LOG_BUFFER = deque(maxlen=1000)
+
 app = FastAPI()
 
 # Enable CORS to allow the browser to verify the endpoint directly
@@ -62,6 +84,34 @@ class InvoiceResponse(BaseModel):
             raise ValueError("Date must be in the exact format YYYY-MM-DD.")
         return v_clean
 
+
+# --- Middleware ---
+@app.middleware("http")
+async def instrumentation_middleware(request: Request, call_next):
+    # 1. Increment Prometheus counter for every single request
+    REQUEST_COUNTER.inc()
+    
+    # 2. Generate required log fields
+    req_id = str(uuid.uuid4())
+    ts = datetime.now(timezone.utc).isoformat()
+    path = request.url.path
+    
+    # Structure the JSON log entry
+    log_entry = {
+        "level": "INFO",
+        "ts": ts,
+        "path": path,
+        "request_id": req_id,
+        "method": request.method
+    }
+    
+    # Append to our in-memory deque
+    LOG_BUFFER.append(log_entry)
+    
+    # Process the actual request
+    response = await call_next(request)
+    return response
+
 @app.get("/")
 def read_root():
     return {"message": "This is app.py!"}
@@ -106,6 +156,32 @@ async def process_analytics(payload: AnalyticsRequest, request: Request):
         "revenue": revenue,
         "top_user": top_user
     }
+
+@app.get("/work")
+def do_work(n: int = 0):
+    # Returns the specified format. Using a dummy email as requested.
+    return {"email": "student@example.com", "done": n}
+
+@app.get("/metrics")
+def get_metrics():
+    # Expose Prometheus metrics in the standard text format
+    metrics_data = generate_latest()
+    return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/healthz")
+def health_check():
+    # Calculate non-negative float uptime in seconds
+    uptime_s = max(0.0, time.time() - START_TIME)
+    return {"status": "ok", "uptime_s": uptime_s}
+
+@app.get("/logs/tail")
+def tail_logs(limit: int = 10):
+    # Slice the deque to get the last N entries
+    # deque doesn't support direct slicing, so we convert to a list
+    logs_list = list(LOG_BUFFER)
+    
+    # If limit is greater than available logs, this safely returns what we have
+    return logs_list[-limit:]
 
 @app.post(
     "/extract", 

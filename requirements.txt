@@ -4,3 +4,5 @@ PyJWT[crypto]
 uvicorn[standard]
 pydantic
 uvicorn
+openai
+prometheus-client

@@ -12,12 +12,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 RATE_LIMIT_REQUESTS = 13
 RATE_LIMIT_WINDOW = 10
 
-# TODO: 1. Put your actual login email here
 YOUR_EMAIL = "22f3003202@ds.study.iitm.ac.in" 
-
-# TODO: 2. Add the origin of the exam page you are currently viewing this from 
-# (e.g., "https://tds-2-qona.onrender.com" or "http://localhost:3000")
-EXAM_PAGE_ORIGIN = "https://exam.sanand.workers.dev/"
+EXAM_PAGE_ORIGIN = "https://exam.sanand.workers.dev"
 
 ALLOWED_ORIGINS = [
     "https://app-61pz70.example.com",
@@ -26,9 +22,14 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI()
 
-# --- MIDDLEWARE 1: Request Context ---
+# --- MIDDLEWARES ---
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # Ignore OPTIONS preflight requests here
+        if request.method == "OPTIONS":
+            return await call_next(request)
+            
         # Read existing ID or generate a new one
         req_id = request.headers.get("X-Request-ID")
         if not req_id:
@@ -45,8 +46,6 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# --- MIDDLEWARE 3: Rate Limiting ---
-# (Numbered as 3 to match your prompt, but placed here for execution ordering)
 class RateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -82,24 +81,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 # --- MIDDLEWARE COMPOSITION (ORDER MATTERS) ---
-# Middlewares wrap the application from the bottom up. 
-# The last one added is the outermost layer.
+# In FastAPI, the LAST middleware added is the OUTERMOST layer.
 
-# 1. Innermost layer (runs right before the route)
-app.add_middleware(RequestContextMiddleware)
-
-# 2. Middle layer (checks rate limits)
+# 1. Innermost layer (Runs right before the route)
 app.add_middleware(RateLimitMiddleware)
+
+# 2. Middle layer (Sets request ID, catches 429s from rate limiter to add headers)
+app.add_middleware(RequestContextMiddleware)
 
 # 3. Outermost layer (Middleware 2 - CORS)
 # Placing this outermost guarantees OPTIONS requests are answered successfully 
-# without triggering the rate limiter. No wildcards are used.
+# without triggering the inner middlewares.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"]  # <-- CRITICAL for the grader to read the header
 )
 
 

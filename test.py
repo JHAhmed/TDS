@@ -1,112 +1,116 @@
+# main.py
+from __future__ import annotations
+
+import asyncio
+import os
 import time
 import uuid
-import threading
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Deque, Dict, Optional
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse
 
-# --- ASSIGNED VALUES & CONFIGURATION ---
-RATE_LIMIT_REQUESTS = 13
-RATE_LIMIT_WINDOW = 10
+# Assigned values
+ALLOWED_CORS_ORIGIN = "https://app-61pz70.example.com"
+RATE_LIMIT_BUCKET = 13
+RATE_LIMIT_WINDOW_SECONDS = 10
 
-# TODO: 1. Put your actual login email here
-YOUR_EMAIL = "22f3003202@ds.study.iitm.ac.in" 
+# Set this to the exam page origin used by the verifier.
+# Example:
+# EXAM_PAGE_ORIGIN="https://your-exam-page.example.com"
+EXAM_PAGE_ORIGIN = os.getenv("https://exam.sanand.workers.dev/", "")
 
-# TODO: 2. Add the origin of the exam page you are currently viewing this from 
-# (e.g., "https://tds-2-qona.onrender.com" or "http://localhost:3000")
-EXAM_PAGE_ORIGIN = "https://exam.sanand.workers.dev/tds-2026-05-ga2"
+# Set your logged-in address here or via env var.
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "22f3003202@ds.study.iitm.ac.in")
 
-ALLOWED_ORIGINS = [
-    "https://app-61pz70.example.com",
-    EXAM_PAGE_ORIGIN
-]
+app = FastAPI(title="Ping Service")
 
-app = FastAPI()
+allowed_origins = [ALLOWED_CORS_ORIGIN]
+if EXAM_PAGE_ORIGIN and EXAM_PAGE_ORIGIN != ALLOWED_CORS_ORIGIN:
+    allowed_origins.append(EXAM_PAGE_ORIGIN)
 
-# --- MIDDLEWARE 1: Request Context ---
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Read existing ID or generate a new one
-        req_id = request.headers.get("X-Request-ID")
-        if not req_id:
-            req_id = str(uuid.uuid4())
-            
-        # Store in request state for the endpoint to use
-        request.state.request_id = req_id
-        
-        # Process the request
-        response = await call_next(request)
-        
-        # Append the ID to the response headers
-        response.headers["X-Request-ID"] = req_id
-        return response
-
-
-# --- MIDDLEWARE 3: Rate Limiting ---
-# (Numbered as 3 to match your prompt, but placed here for execution ordering)
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app):
-        super().__init__(app)
-        self.client_requests = defaultdict(deque)
-        self.lock = threading.Lock()
-
-    async def dispatch(self, request: Request, call_next):
-        # Bypass rate limiting for CORS preflight OPTIONS requests
-        if request.method == "OPTIONS":
-            return await call_next(request)
-            
-        client_id = request.headers.get("X-Client-Id", "anonymous")
-        now = time.time()
-        
-        with self.lock:
-            q = self.client_requests[client_id]
-            
-            # Remove timestamps older than the 10-second window
-            while q and q[0] <= now - RATE_LIMIT_WINDOW:
-                q.popleft()
-                
-            # Check bucket limit
-            if len(q) >= RATE_LIMIT_REQUESTS:
-                return JSONResponse(
-                    status_code=429, 
-                    content={"detail": "Too Many Requests"}
-                )
-                
-            # Log the request
-            q.append(now)
-            
-        return await call_next(request)
-
-
-# --- MIDDLEWARE COMPOSITION (ORDER MATTERS) ---
-# Middlewares wrap the application from the bottom up. 
-# The last one added is the outermost layer.
-
-# 1. Innermost layer (runs right before the route)
-app.add_middleware(RequestContextMiddleware)
-
-# 2. Middle layer (checks rate limits)
-app.add_middleware(RateLimitMiddleware)
-
-# 3. Outermost layer (Middleware 2 - CORS)
-# Placing this outermost guarantees OPTIONS requests are answered successfully 
-# without triggering the rate limiter. No wildcards are used.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["X-Client-Id", "X-Request-ID", "Content-Type"],
+    expose_headers=["X-Request-ID"],
 )
 
+# Sliding-window rate-limit state
+client_hits: Dict[str, Deque[float]] = defaultdict(deque)
+rate_limit_lock = asyncio.Lock()
 
-# --- ENDPOINT ---
+
+def _retry_after_seconds(now: float, oldest_hit: float) -> int:
+    remaining = RATE_LIMIT_WINDOW_SECONDS - (now - oldest_hit)
+    return max(1, int(remaining + 0.999999))
+
+
+async def _check_rate_limit(client_id: str) -> Optional[int]:
+    now = time.time()
+    async with rate_limit_lock:
+        q = client_hits[client_id]
+
+        cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+        while q and q[0] <= cutoff:
+            q.popleft()
+
+        if len(q) >= RATE_LIMIT_BUCKET:
+            return _retry_after_seconds(now, q[0])
+
+        q.append(now)
+        return None
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.middleware("http")
+async def per_client_rate_limit_middleware(request: Request, call_next):
+    # Do not block CORS preflight.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    client_id = request.headers.get("X-Client-Id", "anonymous")
+    retry_after = await _check_rate_limit(client_id)
+
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    return await call_next(request)
+
+
 @app.get("/ping")
 async def ping(request: Request):
     return {
-        "email": YOUR_EMAIL,
-        "request_id": request.state.request_id
+        "email": EMAIL_ADDRESS,
+        "request_id": request.state.request_id,
     }
+
+
+@app.options("/ping")
+async def ping_options():
+    # CORSMiddleware handles the actual CORS preflight response.
+    return Response(status_code=204)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

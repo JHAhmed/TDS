@@ -1,163 +1,112 @@
-# main.py
-from __future__ import annotations
-
-import base64
-import math
-import threading
 import time
 import uuid
+import threading
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, List, Optional
+
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
-TOTAL_ORDERS = 53
-RATE_LIMIT = 15
-WINDOW_SECONDS = 10
+# --- ASSIGNED VALUES & CONFIGURATION ---
+RATE_LIMIT_REQUESTS = 13
+RATE_LIMIT_WINDOW = 10
 
-app = FastAPI(title="Orders API")
+# TODO: 1. Put your actual login email here
+YOUR_EMAIL = "22f3003202@ds.study.iitm.ac.in" 
 
+# TODO: 2. Add the origin of the exam page you are currently viewing this from 
+# (e.g., "https://tds-2-qona.onrender.com" or "http://localhost:3000")
+EXAM_PAGE_ORIGIN = "https://exam.sanand.workers.dev/tds-2026-05-ga2"
+
+ALLOWED_ORIGINS = [
+    "https://app-61pz70.example.com",
+    EXAM_PAGE_ORIGIN
+]
+
+app = FastAPI()
+
+# --- MIDDLEWARE 1: Request Context ---
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Read existing ID or generate a new one
+        req_id = request.headers.get("X-Request-ID")
+        if not req_id:
+            req_id = str(uuid.uuid4())
+            
+        # Store in request state for the endpoint to use
+        request.state.request_id = req_id
+        
+        # Process the request
+        response = await call_next(request)
+        
+        # Append the ID to the response headers
+        response.headers["X-Request-ID"] = req_id
+        return response
+
+
+# --- MIDDLEWARE 3: Rate Limiting ---
+# (Numbered as 3 to match your prompt, but placed here for execution ordering)
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        self.client_requests = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    async def dispatch(self, request: Request, call_next):
+        # Bypass rate limiting for CORS preflight OPTIONS requests
+        if request.method == "OPTIONS":
+            return await call_next(request)
+            
+        client_id = request.headers.get("X-Client-Id", "anonymous")
+        now = time.time()
+        
+        with self.lock:
+            q = self.client_requests[client_id]
+            
+            # Remove timestamps older than the 10-second window
+            while q and q[0] <= now - RATE_LIMIT_WINDOW:
+                q.popleft()
+                
+            # Check bucket limit
+            if len(q) >= RATE_LIMIT_REQUESTS:
+                return JSONResponse(
+                    status_code=429, 
+                    content={"detail": "Too Many Requests"}
+                )
+                
+            # Log the request
+            q.append(now)
+            
+        return await call_next(request)
+
+
+# --- MIDDLEWARE COMPOSITION (ORDER MATTERS) ---
+# Middlewares wrap the application from the bottom up. 
+# The last one added is the outermost layer.
+
+# 1. Innermost layer (runs right before the route)
+app.add_middleware(RequestContextMiddleware)
+
+# 2. Middle layer (checks rate limits)
+app.add_middleware(RateLimitMiddleware)
+
+# 3. Outermost layer (Middleware 2 - CORS)
+# Placing this outermost guarantees OPTIONS requests are answered successfully 
+# without triggering the rate limiter. No wildcards are used.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-lock = threading.Lock()
 
-# Idempotency store: key -> full response body
-idempotency_store: Dict[str, Dict[str, Any]] = {}
-
-# Per-client request timestamps for sliding-window rate limiting
-client_requests: Dict[str, Deque[float]] = defaultdict(deque)
-
-# Fixed catalog 1..T
-CATALOG: List[Dict[str, Any]] = [
-    {"id": i, "name": f"Order #{i}"} for i in range(1, TOTAL_ORDERS + 1)
-]
-
-
-class OrderCreateIn(BaseModel):
-    # Accept any JSON payload
-    item: Optional[str] = None
-    quantity: Optional[int] = Field(default=None, ge=1)
-    notes: Optional[str] = None
-
-
-def _encode_cursor(offset: int) -> str:
-    raw = f"offset:{offset}".encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
-
-
-def _decode_cursor(cursor: str) -> int:
-    try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
-        prefix, offset_str = raw.split(":", 1)
-        if prefix != "offset":
-            raise ValueError
-        offset = int(offset_str)
-        if offset < 0:
-            raise ValueError
-        return offset
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
-
-
-def _rate_limit(client_id: str) -> None:
-    now = time.time()
-    with lock:
-        q = client_requests[client_id]
-
-        # Drop timestamps outside the rolling window
-        cutoff = now - WINDOW_SECONDS
-        while q and q[0] <= cutoff:
-            q.popleft()
-
-        if len(q) >= RATE_LIMIT:
-            retry_after = max(1, math.ceil(WINDOW_SECONDS - (now - q[0])))
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-        q.append(now)
-
-
-def require_client_id(x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id")) -> str:
-    # Bucket each client independently; missing header falls into its own anonymous bucket.
-    return x_client_id or "anonymous"
-
-
-@app.middleware("http")
-async def global_rate_limit_middleware(request: Request, call_next):
-    # Do not rate-limit CORS preflight
-    if request.method == "OPTIONS":
-        return await call_next(request)
-
-    client_id = request.headers.get("X-Client-Id", "anonymous")
-
-    try:
-        _rate_limit(client_id)
-    except HTTPException as exc:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.detail},
-            headers=exc.headers,
-        )
-
-    return await call_next(request)
-
-
-@app.post("/orders", status_code=201)
-async def create_order(
-    payload: OrderCreateIn,
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
-):
-    if not idempotency_key:
-        raise HTTPException(status_code=400, detail="Missing Idempotency-Key")
-
-    with lock:
-        if idempotency_key in idempotency_store:
-            # Return the exact same order record; never create a duplicate.
-            return idempotency_store[idempotency_key]
-
-        order = {
-            "id": f"ord_{uuid.uuid4().hex}",
-            "item": payload.item,
-            "quantity": payload.quantity,
-            "notes": payload.notes,
-        }
-        idempotency_store[idempotency_key] = order
-        return order
-
-
-@app.get("/orders")
-async def list_orders(limit: int = 10, cursor: Optional[str] = None):
-    if limit < 1:
-        raise HTTPException(status_code=400, detail="limit must be >= 1")
-
-    # Optional safety cap; remove if you want unlimited client-specified limit.
-    limit = min(limit, 100)
-
-    offset = 0 if cursor is None else _decode_cursor(cursor)
-    if offset > TOTAL_ORDERS:
-        raise HTTPException(status_code=400, detail="Cursor out of range")
-
-    items = CATALOG[offset : offset + limit]
-    next_offset = offset + len(items)
-
+# --- ENDPOINT ---
+@app.get("/ping")
+async def ping(request: Request):
     return {
-        "items": items,
-        "next_cursor": _encode_cursor(next_offset) if next_offset < TOTAL_ORDERS else None,
+        "email": YOUR_EMAIL,
+        "request_id": request.state.request_id
     }
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True}

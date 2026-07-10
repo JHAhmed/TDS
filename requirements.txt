@@ -6,3 +6,4 @@ pydantic
 uvicorn
 openai
 prometheus-client
+redis

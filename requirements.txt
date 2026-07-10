@@ -7,3 +7,4 @@ uvicorn
 openai
 prometheus-client
 redis
+numpy

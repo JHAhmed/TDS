@@ -69,80 +69,49 @@ def build_dynamic_model(schema_dict: Dict[str, str], model_name: str = "DynamicE
     return create_model(model_name, **fields)
 
 
-class LineItem(BaseModel):
-    sku: str = Field(..., description="Stock Keeping Unit identifier code exactly as written.")
-    quantity: int = Field(..., description="The quantity of the item as an integer.")
-    unit_price: int = Field(..., description="The unit price as an integer (main unit).")
-
-class InvoiceSchema(BaseModel):
-    vendor: str = Field(..., description="The biller's proper name, exactly as written.")
-    currency: str = Field(..., description="The ISO 4217 code (e.g., USD, EUR, GBP, INR, JPY) matching the text currency indicator.")
-    total_amount: int = Field(..., description="Integer representing the total amount in the main unit (no separators, symbols, or decimals). Parse text numbers or abbreviations like 12K into integers.")
-    invoice_date: str = Field(..., description="Normalized invoice date in YYYY-MM-DD format.")
-    due_in_days: int = Field(..., description="The payment terms converted to an integer number of days (e.g., 'Net 30' -> 30, 'due in two weeks' -> 14).")
-    is_paid: bool = Field(..., description="Boolean inference based on text wording (e.g., 'paid in full' -> true, 'awaiting payment' -> false).")
-    priority: Literal["low", "normal", "high", "urgent"] = Field(..., description="The implied priority category.")
-    contact_email: str = Field(..., description="The lowercased contact email address found in the document.")
-    line_items: List[LineItem] = Field(..., description="Array of line items in the order they appear.")
-    item_count: int = Field(..., description="The total count of line items present in the array.")
 
 
-class ExtractRequest(BaseModel):
-    document_id: str
-    text: str
-    schema_definition: Dict[str, Any] = Field(..., alias="schema") 
+class InvoiceExtraction(BaseModel):
+    invoice_no: Optional[str] = Field(default=None, description="The invoice number. null if not found.")
+    date: Optional[str] = Field(default=None, description="Date of the invoice in strictly YYYY-MM-DD format. null if not found.")
+    vendor: Optional[str] = Field(default=None, description="The vendor, seller, or company name. null if not found.")
+    amount: Optional[float] = Field(default=None, description="The subtotal amount BEFORE tax. null if not found.")
+    tax: Optional[float] = Field(default=None, description="The tax or VAT amount. null if not found.")
+    currency: Optional[str] = Field(default=None, description="The currency of the invoice (e.g., INR, USD). null if not found.")
+
+# 2. Input Schema (API Request)
+class InvoiceRequest(BaseModel):
+    invoice_text: str
+
+@app.post("/extract", response_model=InvoiceExtraction)
+async def extract_invoice(request: InvoiceRequest):
+    """
+    Extracts structured fields from raw invoice text using OpenAI Structured Outputs.
+    """
+    system_prompt = (
+        "You are an expert financial data extraction assistant. "
+        "Extract the exact fields requested from the provided invoice text. "
+        "Strict rules:\n"
+        "1. 'date' must be strictly in ISO format (YYYY-MM-DD).\n"
+        "2. 'amount' is the subtotal BEFORE tax.\n"
+        "3. 'tax' is the tax amount only.\n"
+        "4. If a field cannot be found, explicitly return null."
+    )
     
-    class Config:
-        populate_by_name = True
-
-
-# --- API Endpoint ---
-
-@app.post("/extract")
-async def extract_invoice(payload: ExtractRequest):
-    try:
-        # Request a strongly typed parse from OpenAI
-        completion = client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert data extraction microservice for an ERP system. "
-                        "Read the provided free-text document carefully and extract all required properties. "
-                        "Follow these rules strictly:\n"
-                        "1. currency must be normalized to a standard 3-letter ISO 4217 code.\n"
-                        "2. total_amount, quantity, and unit_price must be pure integers.\n"
-                        "3. invoice_date must follow YYYY-MM-DD format.\n"
-                        "4. due_in_days must be calculated as an absolute integer number of days.\n"
-                        "5. contact_email must be converted entirely to lowercase.\n"
-                        "6. line_items must match the original order of appearance, and item_count must equal len(line_items)."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": payload.text
-                }
-            ],
-            response_format=InvoiceSchema,
-        )
-        
-        extracted_data = completion.choices[0].message.parsed
-        
-        if not extracted_data:
-            raise HTTPException(status_code=500, detail="LLM failed to produce valid structured schema outputs.")
-        
-        # Return exact JSON fields to the grader without markdown wrappers or extra keys
-        return JSONResponse(
-            status_code=200,
-            content=extracted_data.model_dump()
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction failure on document {payload.document_id}: {str(e)}"
-        )
+    # Use OpenAI's Beta Parse endpoint for guaranteed Structured Outputs
+    completion = client.beta.chat.completions.parse(
+        model="gpt-4o-mini",  # Fast, cost-effective, and highly capable for text extraction
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.invoice_text}
+        ],
+        response_format=InvoiceExtraction,
+        temperature=0.0  # Lowest temperature for deterministic, factual extraction
+    )
+    
+    # The .parsed property directly yields the Pydantic object, 
+    # which FastAPI automatically serializes to the exact required JSON schema.
+    return completion.choices[0].message.parsed
 
 # --- API Endpoint ---
 
@@ -154,7 +123,7 @@ async def dynamic_extract_data(payload: DynamicExtractRequest):
         
         # 2. Call OpenAI enforcing the dynamic schema
         completion = client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model="gpt-5.4-mini",
             messages=[
                 {
                     "role": "system",

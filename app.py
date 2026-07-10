@@ -1,3 +1,5 @@
+# Q2
+
 import os
 import re
 import json
@@ -104,142 +106,72 @@ def _extract_answer(raw_text: str) -> str:
 
     return text.strip('"\'')
 
-class ExtractRequest(BaseModel):
+
+
+
+class ExtractionRequest(BaseModel):
     invoice_text: str
 
-
-def clean_text(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    value = value.strip()
-    return value if value else None
-
-
-def parse_date(text: str) -> Optional[str]:
-    patterns = [
-        r"\b(\d{4})-(\d{2})-(\d{2})\b",
-        r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b",
-        r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b",
-    ]
-
-    month_map = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
-    }
-
-    m = re.search(patterns[0], text)
-    if m:
-        try:
-            return datetime.strptime(m.group(0), "%Y-%m-%d").strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-
-    m = re.search(patterns[1], text)
-    if m:
-        d, mo, y = m.groups()
-        try:
-            return datetime(int(y), int(mo), int(d)).strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-
-    m = re.search(patterns[2], text, flags=re.I)
-    if m:
-        d, month_name, y = m.groups()
-        month = month_map.get(month_name.lower())
-        if month:
-            try:
-                return datetime(int(y), month, int(d)).strftime("%Y-%m-%d")
-            except ValueError:
-                pass
-
-    return None
+class InvoiceExtraction(BaseModel):
+    """
+    Strict schema enforced by OpenAI's Structured Outputs.
+    All fields are Optional to allow 'null' if the data cannot be found.
+    """
+    invoice_no: Optional[str] = Field(None, description="The invoice or bill number.")
+    date: Optional[str] = Field(None, description="The invoice date, STRICTLY formatted as ISO 8601 YYYY-MM-DD.")
+    vendor: Optional[str] = Field(None, description="The name of the seller or vendor.")
+    amount: Optional[float] = Field(None, description="The subtotal amount before taxes. Do not include currency symbols.")
+    tax: Optional[float] = Field(None, description="The tax or VAT amount only. Do not include currency symbols.")
+    currency: Optional[str] = Field(None, description="The 3-letter currency code (e.g., INR, USD).")
 
 
-def parse_money(value: Optional[str]) -> Optional[float]:
-    if value is None:
-        return None
-    value = value.replace(",", "")
-    m = re.search(r"[-+]?\d+(?:\.\d+)?", value)
-    if not m:
-        return None
+
+@app.post("/extract", response_model=InvoiceExtraction)
+async def extract_invoice_data(payload: ExtractionRequest):
     try:
-        return float(m.group(0))
-    except ValueError:
-        return None
+        # Call OpenAI with strict schema enforcement
+        completion = client.beta.chat.completions.parse(
+            model="gpt-5.4-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise data extraction API. Extract the requested fields from the invoice text. "
+                        "If a field cannot be found, return null. "
+                        "The 'date' MUST be in YYYY-MM-DD format. "
+                        "'amount' is the subtotal before tax. 'tax' is the tax amount only."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": payload.invoice_text
+                }
+            ],
+            response_format=InvoiceExtraction,
+        )
+        
+        result = completion.choices[0].message.parsed
+        
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to parse model response.")
+
+        # FastAPI will automatically serialize this Pydantic model to the exact required JSON
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-def find_first(patterns, text, flags=re.I):
-    for pat in patterns:
-        m = re.search(pat, text, flags)
-        if m:
-            return clean_text(m.group(1))
-    return None
 
 
-@app.post("/extract")
-def extract_invoice(payload: ExtractRequest):
-    text = payload.invoice_text or ""
 
-    invoice_no = find_first(
-        [
-            r"Invoice\s*No[:\s]*([A-Za-z0-9\-\/]+)",
-            r"Invoice\s*Number[:\s]*([A-Za-z0-9\-\/]+)",
-            r"Inv(?:oice)?\s*#[:\s]*([A-Za-z0-9\-\/]+)",
-        ],
-        text,
-    )
 
-    vendor = find_first(
-        [
-            r"Vendor[:\s]*(.+)",
-            r"Supplier[:\s]*(.+)",
-            r"Billed\s*From[:\s]*(.+)",
-            r"From[:\s]*(.+)",
-        ],
-        text,
-    )
-    if vendor:
-        vendor = vendor.split("\n")[0].strip()
 
-    date = parse_date(text)
-
-    # Subtotal / amount before tax
-    amount_raw = find_first(
-        [
-            r"Subtotal[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-            r"Sub\s*Total[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-            r"Amount\s*Before\s*Tax[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-            r"Net\s*Amount[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-        ],
-        text,
-    )
-    amount = parse_money(amount_raw)
-
-    # Tax / GST
-    tax_raw = find_first(
-        [
-            r"GST(?:\s*\([^)]*\))?[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-            r"Tax[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-            r"VAT[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
-        ],
-        text,
-    )
-    tax = parse_money(tax_raw)
-
-    return {
-        "invoice_no": invoice_no,
-        "date": date,
-        "vendor": vendor,
-        "amount": amount,
-        "tax": tax,
-        "currency": "INR",
-    }
 
 
 @app.get("/")
 def get_root():
-    return {"message": "this is main.py"}
+    return {"message": "this is app.py"}
 
 @app.get("/health")
 def health():
@@ -258,7 +190,7 @@ async def answer_image(payload: AnswerImageRequest):
         "Return ONLY a JSON object with exactly one key: answer.\n"
         "The value must be a string.\n"
         "For numeric answers, return only the number, with no currency symbols, commas, or units.\n"
-        "Do not include any extra text. Invoice number cannot be null"
+        "Do not include any extra text."
     )
 
     try:

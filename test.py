@@ -1,111 +1,195 @@
-import time
-import uuid
-import threading
-from collections import defaultdict, deque
+# Q3, Q4
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+import os
+from typing import Optional, List, Any, Dict, Literal
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, create_model
+from openai import OpenAI
 
-# --- ASSIGNED VALUES & CONFIGURATION ---
-RATE_LIMIT_REQUESTS = 13
-RATE_LIMIT_WINDOW = 10
+# Initialize FastAPI app
+app = FastAPI(title="Dynamic Invoice & Data Extractor API")
 
-YOUR_EMAIL = "22f3003202@ds.study.iitm.ac.in" 
-EXAM_PAGE_ORIGIN = "https://exam.sanand.workers.dev"
-
-ALLOWED_ORIGINS = [
-    "https://app-61pz70.example.com",
-    EXAM_PAGE_ORIGIN
-]
-
-app = FastAPI()
-
-# --- MIDDLEWARES ---
-
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Ignore OPTIONS preflight requests here
-        if request.method == "OPTIONS":
-            return await call_next(request)
-            
-        # Read existing ID or generate a new one
-        req_id = request.headers.get("X-Request-ID")
-        if not req_id:
-            req_id = str(uuid.uuid4())
-            
-        # Store in request state for the endpoint to use
-        request.state.request_id = req_id
-        
-        # Process the request
-        response = await call_next(request)
-        
-        # Append the ID to the response headers
-        response.headers["X-Request-ID"] = req_id
-        return response
-
-
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app):
-        super().__init__(app)
-        self.client_requests = defaultdict(deque)
-        self.lock = threading.Lock()
-
-    async def dispatch(self, request: Request, call_next):
-        # Bypass rate limiting for CORS preflight OPTIONS requests
-        if request.method == "OPTIONS":
-            return await call_next(request)
-            
-        client_id = request.headers.get("X-Client-Id", "anonymous")
-        now = time.time()
-        
-        with self.lock:
-            q = self.client_requests[client_id]
-            
-            # Remove timestamps older than the 10-second window
-            while q and q[0] <= now - RATE_LIMIT_WINDOW:
-                q.popleft()
-                
-            # Check bucket limit
-            if len(q) >= RATE_LIMIT_REQUESTS:
-                return JSONResponse(
-                    status_code=429, 
-                    content={"detail": "Too Many Requests"}
-                )
-                
-            # Log the request
-            q.append(now)
-            
-        return await call_next(request)
-
-
-# --- MIDDLEWARE COMPOSITION (ORDER MATTERS) ---
-# In FastAPI, the LAST middleware added is the OUTERMOST layer.
-
-# 1. Innermost layer (Runs right before the route)
-app.add_middleware(RateLimitMiddleware)
-
-# 2. Middle layer (Sets request ID, catches 429s from rate limiter to add headers)
-app.add_middleware(RequestContextMiddleware)
-
-# 3. Outermost layer (Middleware 2 - CORS)
-# Placing this outermost guarantees OPTIONS requests are answered successfully 
-# without triggering the inner middlewares.
+# Enable CORS (Required by grader)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"]  # <-- CRITICAL for the grader to read the header
 )
 
+# Initialize OpenAI Client (automatically reads OPENAI_API_KEY from environment)
+client = OpenAI()
 
-# --- ENDPOINT ---
-@app.get("/ping")
-async def ping(request: Request):
-    return {
-        "email": YOUR_EMAIL,
-        "request_id": request.state.request_id
-    }
+# --- Request Schemas ---
+
+class DynamicExtractRequest(BaseModel):
+    text: str
+    # Use an alias so we don't conflict with Pydantic's internal 'schema' namespace
+    schema_definition: Dict[str, str] = Field(..., alias="schema") 
+
+    class Config:
+        populate_by_name = True
+
+
+# --- Dynamic Model Builder Helper ---
+
+def build_dynamic_model(schema_dict: Dict[str, str], model_name: str = "DynamicExtraction") -> Any:
+    """
+    Reads the simplified schema dictionary provided in the request
+    and dynamically builds a Pydantic model for OpenAI to enforce.
+    """
+    fields = {}
+    
+    for key, field_type in schema_dict.items():
+        # Map requested types to Python/Pydantic types
+        # Everything is wrapped in Optional to allow 'null' if missing from text
+        if field_type == "string":
+            fields[key] = (Optional[str], Field(default=None))
+        elif field_type == "integer":
+            fields[key] = (Optional[int], Field(default=None))
+        elif field_type == "float":
+            fields[key] = (Optional[float], Field(default=None))
+        elif field_type == "boolean":
+            fields[key] = (Optional[bool], Field(default=None))
+        elif field_type == "date":
+            # Add explicit instructions for the date format directly into the dynamic field description
+            fields[key] = (Optional[str], Field(default=None, description="STRICTLY ISO format YYYY-MM-DD"))
+        elif field_type == "array[string]":
+            fields[key] = (Optional[List[str]], Field(default=None))
+        elif field_type == "array[integer]":
+            fields[key] = (Optional[List[int]], Field(default=None))
+        else:
+            # Fallback to string if an unknown type is passed
+            fields[key] = (Optional[str], Field(default=None))
+            
+    # Dynamically create and return the Pydantic class
+    return create_model(model_name, **fields)
+
+
+class LineItem(BaseModel):
+    sku: str = Field(..., description="Stock Keeping Unit identifier code exactly as written.")
+    quantity: int = Field(..., description="The quantity of the item as an integer.")
+    unit_price: int = Field(..., description="The unit price as an integer (main unit).")
+
+class InvoiceSchema(BaseModel):
+    vendor: str = Field(..., description="The biller's proper name, exactly as written.")
+    currency: str = Field(..., description="The ISO 4217 code (e.g., USD, EUR, GBP, INR, JPY) matching the text currency indicator.")
+    total_amount: int = Field(..., description="Integer representing the total amount in the main unit (no separators, symbols, or decimals). Parse text numbers or abbreviations like 12K into integers.")
+    invoice_date: str = Field(..., description="Normalized invoice date in YYYY-MM-DD format.")
+    due_in_days: int = Field(..., description="The payment terms converted to an integer number of days (e.g., 'Net 30' -> 30, 'due in two weeks' -> 14).")
+    is_paid: bool = Field(..., description="Boolean inference based on text wording (e.g., 'paid in full' -> true, 'awaiting payment' -> false).")
+    priority: Literal["low", "normal", "high", "urgent"] = Field(..., description="The implied priority category.")
+    contact_email: str = Field(..., description="The lowercased contact email address found in the document.")
+    line_items: List[LineItem] = Field(..., description="Array of line items in the order they appear.")
+    item_count: int = Field(..., description="The total count of line items present in the array.")
+
+
+class ExtractRequest(BaseModel):
+    document_id: str
+    text: str
+    schema_definition: Dict[str, Any] = Field(..., alias="schema") 
+    
+    class Config:
+        populate_by_name = True
+
+
+# --- API Endpoint ---
+
+@app.post("/extract")
+async def extract_invoice(payload: ExtractRequest):
+    try:
+        # Request a strongly typed parse from OpenAI
+        completion = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert data extraction microservice for an ERP system. "
+                        "Read the provided free-text document carefully and extract all required properties. "
+                        "Follow these rules strictly:\n"
+                        "1. currency must be normalized to a standard 3-letter ISO 4217 code.\n"
+                        "2. total_amount, quantity, and unit_price must be pure integers.\n"
+                        "3. invoice_date must follow YYYY-MM-DD format.\n"
+                        "4. due_in_days must be calculated as an absolute integer number of days.\n"
+                        "5. contact_email must be converted entirely to lowercase.\n"
+                        "6. line_items must match the original order of appearance, and item_count must equal len(line_items)."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": payload.text
+                }
+            ],
+            response_format=InvoiceSchema,
+        )
+        
+        extracted_data = completion.choices[0].message.parsed
+        
+        if not extracted_data:
+            raise HTTPException(status_code=500, detail="LLM failed to produce valid structured schema outputs.")
+        
+        # Return exact JSON fields to the grader without markdown wrappers or extra keys
+        return JSONResponse(
+            status_code=200,
+            content=extracted_data.model_dump()
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction failure on document {payload.document_id}: {str(e)}"
+        )
+
+# --- API Endpoint ---
+
+@app.post("/dynamic-extract")
+async def dynamic_extract_data(payload: DynamicExtractRequest):
+    try:
+        # 1. Build the exact Pydantic model required for this specific request
+        DynamicModel = build_dynamic_model(payload.schema_definition)
+        
+        # 2. Call OpenAI enforcing the dynamic schema
+        completion = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise data extraction API. Extract the requested fields from the text based on the schema. "
+                        "Rules:\n"
+                        "- If a field cannot be found in the text, you MUST return null.\n"
+                        "- Dates MUST be formatted as YYYY-MM-DD.\n"
+                        "- Numbers must be purely JSON numbers, not strings.\n"
+                        "- Do not guess or hallucinate information not present in the text."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": payload.text
+                }
+            ],
+            response_format=DynamicModel,
+        )
+        
+        result = completion.choices[0].message.parsed
+        
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to parse model response.")
+
+        # 3. Dump the model to a dictionary. 
+        # Using standard model_dump() ensures missing fields remain explicitly as 'null' instead of being deleted.
+        return JSONResponse(
+            status_code=200,
+            content=result.model_dump()
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

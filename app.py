@@ -1,39 +1,26 @@
-from fastapi import FastAPI, Request, HTTPException
+import os
+import re
+import json
+import base64
+from typing import Any, Dict
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from openai import AsyncOpenAI
+
+import re
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
 
-import os
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
-import openai
 
-import time
-import uuid
-from datetime import datetime, timezone
-from collections import deque
-from fastapi import FastAPI, Request, Response
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
-app = FastAPI(title="Instrumented API")
+app = FastAPI(title="Multimodal QA API")
 
-# --- Globals & State ---
-# Track startup time for /healthz uptime calculation
-START_TIME = time.time()
-
-# Prometheus counter for all HTTP requests
-REQUEST_COUNTER = Counter(
-    "http_requests_total", 
-    "Total number of HTTP requests to any endpoint"
-)
-
-# In-memory buffer for logs, kept to a max size to prevent memory leaks
-LOG_BUFFER = deque(maxlen=1000)
-
-app = FastAPI()
-
-# Enable CORS to allow the browser to verify the endpoint directly
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,196 +29,263 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Assigned constants
-API_KEY = "ak_wxkxdqp9va50jgypae8qir3q"
-EMAIL = "22f3003202@ds.study.iitm.ac.in"
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Pydantic schemas for request validation
-class Event(BaseModel):
-    user: str
-    amount: float
-    ts: int
 
-class AnalyticsRequest(BaseModel):
-    events: List[Event]
+class AnswerImageRequest(BaseModel):
+    image_base64: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
 
-client = openai.OpenAI()
 
-# --- Request & Response Schemas ---
+class AnswerImageResponse(BaseModel):
+    answer: str
+
+
+def _infer_mime(raw: bytes) -> str:
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+        return "image/gif"
+    if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+def _to_data_url(image_base64: str) -> str:
+    s = image_base64.strip()
+    if s.startswith("data:"):
+        return s
+
+    s = re.sub(r"\s+", "", s)
+    try:
+        raw = base64.b64decode(s, validate=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+
+    mime = _infer_mime(raw)
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('utf-8')}"
+
+
+def _extract_answer(raw_text: str) -> str:
+    text = raw_text.strip()
+
+    # Remove common wrappers
+    text = text.strip("`").strip()
+
+    # Try to parse JSON first
+    def try_parse_json(candidate: str) -> Dict[str, Any] | None:
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and "answer" in obj:
+                return obj
+        except Exception:
+            return None
+        return None
+
+    obj = try_parse_json(text)
+    if obj is None:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if m:
+            obj = try_parse_json(m.group(0))
+
+    if obj is not None:
+        ans = str(obj.get("answer", "")).strip()
+        return ans
+
+    # Fallback: use first non-empty line
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        first = lines[0]
+        first = re.sub(r"^(answer\s*[:\-]\s*)", "", first, flags=re.I).strip()
+        return first.strip('"\'')
+
+    return text.strip('"\'')
 
 class ExtractRequest(BaseModel):
-    text: str
-
-class InvoiceResponse(BaseModel):
-    vendor: str = Field(description="The vendor name extracted from the text.")
-    amount: float = Field(description="The total due amount as a numeric float or integer.")
-    currency: str = Field(description="The 3-letter currency code, strictly uppercase (e.g., USD, EUR, GBP).")
-    date: str = Field(description="The payment due date structured exactly as YYYY-MM-DD.")
-
-    @validator('currency')
-    def validate_currency(cls, v):
-        v_clean = v.strip().upper()
-        if len(v_clean) != 3 or not v_clean.isalpha():
-            raise ValueError("Currency must be a 3-letter uppercase alphabetic code.")
-        return v_clean
-
-    @validator('date')
-    def validate_date(cls, v):
-        # Basic check to ensure it adheres to YYYY-MM-DD pattern length and structure
-        v_clean = v.strip()
-        parts = v_clean.split('-')
-        if len(parts) != 3 or len(parts[0]) != 4 or len(parts[1]) != 2 or len(parts[2]) != 2:
-            raise ValueError("Date must be in the exact format YYYY-MM-DD.")
-        return v_clean
+    invoice_text: str
 
 
-# --- Middleware ---
-@app.middleware("http")
-async def instrumentation_middleware(request: Request, call_next):
-    # 1. Increment Prometheus counter for every single request
-    REQUEST_COUNTER.inc()
-    
-    # 2. Generate required log fields
-    req_id = str(uuid.uuid4())
-    ts = datetime.now(timezone.utc).isoformat()
-    path = request.url.path
-    
-    # Structure the JSON log entry
-    log_entry = {
-        "level": "INFO",
-        "ts": ts,
-        "path": path,
-        "request_id": req_id,
-        "method": request.method
+def clean_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def parse_date(text: str) -> Optional[str]:
+    patterns = [
+        r"\b(\d{4})-(\d{2})-(\d{2})\b",
+        r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b",
+        r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b",
+    ]
+
+    month_map = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
     }
-    
-    # Append to our in-memory deque
-    LOG_BUFFER.append(log_entry)
-    
-    # Process the actual request
-    response = await call_next(request)
-    return response
+
+    m = re.search(patterns[0], text)
+    if m:
+        try:
+            return datetime.strptime(m.group(0), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    m = re.search(patterns[1], text)
+    if m:
+        d, mo, y = m.groups()
+        try:
+            return datetime(int(y), int(mo), int(d)).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    m = re.search(patterns[2], text, flags=re.I)
+    if m:
+        d, month_name, y = m.groups()
+        month = month_map.get(month_name.lower())
+        if month:
+            try:
+                return datetime(int(y), month, int(d)).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+    return None
+
+
+def parse_money(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    value = value.replace(",", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", value)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def find_first(patterns, text, flags=re.I):
+    for pat in patterns:
+        m = re.search(pat, text, flags)
+        if m:
+            return clean_text(m.group(1))
+    return None
+
+
+@app.post("/extract")
+def extract_invoice(payload: ExtractRequest):
+    text = payload.invoice_text or ""
+
+    invoice_no = find_first(
+        [
+            r"Invoice\s*No[:\s]*([A-Za-z0-9\-\/]+)",
+            r"Invoice\s*Number[:\s]*([A-Za-z0-9\-\/]+)",
+            r"Inv(?:oice)?\s*#[:\s]*([A-Za-z0-9\-\/]+)",
+        ],
+        text,
+    )
+
+    vendor = find_first(
+        [
+            r"Vendor[:\s]*(.+)",
+            r"Supplier[:\s]*(.+)",
+            r"Billed\s*From[:\s]*(.+)",
+            r"From[:\s]*(.+)",
+        ],
+        text,
+    )
+    if vendor:
+        vendor = vendor.split("\n")[0].strip()
+
+    date = parse_date(text)
+
+    # Subtotal / amount before tax
+    amount_raw = find_first(
+        [
+            r"Subtotal[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+            r"Sub\s*Total[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+            r"Amount\s*Before\s*Tax[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+            r"Net\s*Amount[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+        ],
+        text,
+    )
+    amount = parse_money(amount_raw)
+
+    # Tax / GST
+    tax_raw = find_first(
+        [
+            r"GST(?:\s*\([^)]*\))?[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+            r"Tax[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+            r"VAT[:\s]*([A-Za-z₹Rs\.\s0-9,]+)",
+        ],
+        text,
+    )
+    tax = parse_money(tax_raw)
+
+    return {
+        "invoice_no": invoice_no,
+        "date": date,
+        "vendor": vendor,
+        "amount": amount,
+        "tax": tax,
+        "currency": "INR",
+    }
+
 
 @app.get("/")
-def read_root():
-    return {"message": "This is app.py!"}
+def get_root():
+    return {"message": "this is main.py"}
 
-@app.post("/analytics")
-async def process_analytics(payload: AnalyticsRequest, request: Request):
-    # 1. Authorization Check
-    # We use request.headers.get() to gracefully catch missing headers 
-    # and return a 401 instead of FastAPI's default 422.
-    api_key = request.headers.get("x-api-key")
-    if api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized: Missing or wrong API key")
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-    events = payload.events
-    
-    # 2. Aggregation Logic
-    total_events = len(events)
-    unique_users = set()
-    revenue = 0.0
-    user_revenue = {}
 
-    for event in events:
-        # Track unique users
-        unique_users.add(event.user)
-        
-        # Track positive revenue and user-specific revenue
-        if event.amount > 0:
-            revenue += event.amount
-            user_revenue[event.user] = user_revenue.get(event.user, 0.0) + event.amount
-    
-    # 3. Determine the top user
-    top_user = ""
-    if user_revenue:
-        # Returns the dictionary key (user) with the highest mapped value (revenue)
-        top_user = max(user_revenue, key=user_revenue.get)
+@app.post("/answer-image", response_model=AnswerImageResponse)
+async def answer_image(payload: AnswerImageRequest):
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    # 4. Return structured result
-    return {
-        "email": EMAIL,
-        "total_events": total_events,
-        "unique_users": len(unique_users),
-        "revenue": revenue,
-        "top_user": top_user
-    }
+    image_url = _to_data_url(payload.image_base64)
 
-@app.get("/work")
-def do_work(n: int = 0):
-    # Returns the specified format. Using a dummy email as requested.
-    return {"email": EMAIL, "done": n}
-
-@app.get("/metrics")
-def get_metrics():
-    # Expose Prometheus metrics in the standard text format
-    metrics_data = generate_latest()
-    return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
-
-@app.get("/healthz")
-def health_check():
-    # Calculate non-negative float uptime in seconds
-    uptime_s = max(0.0, time.time() - START_TIME)
-    return {"status": "ok", "uptime_s": uptime_s}
-
-@app.get("/logs/tail")
-def tail_logs(limit: int = 10):
-    # Slice the deque to get the last N entries
-    # deque doesn't support direct slicing, so we convert to a list
-    logs_list = list(LOG_BUFFER)
-    
-    # If limit is greater than available logs, this safely returns what we have
-    return logs_list[-limit:]
-
-@app.post(
-    "/extract", 
-    response_model=InvoiceResponse, 
-    status_code=status.HTTP_200_OK,
-    responses={422: {"description": "Malformed input or extraction failure"}}
-)
-async def extract_invoice(payload: ExtractRequest):
-    # Handle empty or purely whitespace garbage inputs immediately
-    if not payload.text or not payload.text.strip():
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": "Malformed or empty input text provided."}
-        )
+    prompt = (
+        "Answer the user's question using only the information visible in the image.\n"
+        "Return ONLY a JSON object with exactly one key: answer.\n"
+        "The value must be a string.\n"
+        "For numeric answers, return only the number, with no currency symbols, commas, or units.\n"
+        "Do not include any extra text. Invoice number cannot be null"
+    )
 
     try:
-        # Utilizing OpenAI's native Structured Outputs parser
-        completion = client.beta.chat.completions.parse(
-            model="gpt-4o-mini",  # Highly cost-efficient and performant for extraction tasks
-            messages=[
+        resp = await client.responses.create(
+            model=MODEL,
+            input=[
                 {
-                    "role": "system", 
-                    "content": (
-                        "You are an accurate data extraction system. Extract the requested fields "
-                        "from the invoice text. Ensure the amount is numeric, currency is a 3-letter uppercase string, "
-                        "and date is formatted exactly as YYYY-MM-DD. If fields are completely ambiguous or missing, "
-                        "do not hallucinate wild data; let the parsing layer handle validation exceptions safely."
-                    )
-                },
-                {"role": "user", "content": payload.text}
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt + "\n\nQuestion: " + payload.question},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                }
             ],
-            response_format=InvoiceResponse,
-            temperature=0.0, # Enforce deterministic extraction
+            temperature=0,
+            max_output_tokens=100,
         )
 
-        extracted_data = completion.choices[0].message.parsed
-        
-        # Check if the model explicitly refused or failed to output structured data
-        if completion.choices[0].message.refusal or not extracted_data:
-            return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"detail": "Model refused or failed validation for this text layout."}
-            )
+        raw = getattr(resp, "output_text", "") or ""
+        answer = _extract_answer(raw)
 
-        return extracted_data
+        if not answer:
+            raise HTTPException(status_code=500, detail="Model returned an empty answer")
 
+        return {"answer": answer}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        # Intercept any parsing or API connectivity exceptions to satisfy the requirement
-        # that malformed text/garbage input must never throw an unhandled HTTP 500 error.
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": f"Unprocessable invoice data or parsing error: {str(e)}"}
-        )
+        raise HTTPException(status_code=500, detail=f"Inference failed: {e}")

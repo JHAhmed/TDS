@@ -46,7 +46,7 @@ async def solve_problem(payload: ProblemRequest):
     try:
         # Call OpenAI with strict schema enforcement
         completion = client.beta.chat.completions.parse(
-            model="gpt-5.4-mini",
+            model="gpt-4o",
             messages=[
                 {
                     "role": "system",

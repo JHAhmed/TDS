@@ -8,3 +8,7 @@ openai
 prometheus-client
 redis
 numpy
+typing
+httpx
+ipaddress
+uuid
